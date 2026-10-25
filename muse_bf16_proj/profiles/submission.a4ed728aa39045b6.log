@@ -1,0 +1,32 @@
+compiled in 42s
+TUNE m=1 qkv_gate: cublas 21.2us | best cublas:21.2, (1, 1, 4, 8):24.9, (1, 1, 4, 32):25.5, (1, 1, 4, 16):25.9
+TUNE m=1 o: cublas 12.3us | best cublas:12.3, (1, 1, 8, 1):13.0, (1, 2, 4, 1):13.0, (1, 1, 4, 1):13.0
+TUNE m=1 pooler: cublas 30.6us | best cublas:30.6, (1, 1, 4, 16):34.4, (1, 1, 4, 8):34.5, (1, 2, 4, 8):35.0
+TUNE m=1 unpooler: cublas 12.1us | best (1, 1, 8, 16):10.9, (1, 1, 8, 8):11.0, (1, 1, 4, 16):11.1, (1, 1, 8, 4):11.2
+TUNE m=1 router: cublas 21.0us | best (1, 1, 8, 32):10.9, (1, 1, 4, 32):11.1, (1, 1, 8, 16):11.1, (1, 1, 8, 64):11.1
+TUNE m=8 qkv_gate: cublas 21.5us | best cublas:21.5, (1, 1, 4, 8):27.1, (1, 1, 4, 16):27.6, (1, 1, 4, 32):28.0
+TUNE m=8 o: cublas 12.3us | best cublas:12.3, (1, 2, 4, 1):13.3, (1, 1, 8, 1):13.4, (1, 1, 4, 1):13.6
+TUNE m=8 pooler: cublas 30.8us | best cublas:30.8, (1, 1, 4, 8):36.7, (1, 1, 4, 16):36.9, (1, 1, 8, 1):37.0
+TUNE m=8 unpooler: cublas 12.3us | best (1, 1, 8, 8):12.2, cublas:12.3, (1, 1, 4, 8):12.3, (1, 1, 4, 16):12.4
+TUNE m=8 router: cublas 21.2us | best (1, 1, 4, 32):12.2, (1, 1, 8, 32):12.3, (1, 1, 8, 16):12.4, (1, 1, 4, 64):12.7
+TUNE m=16 qkv_gate: cublas 21.6us | best cublas:21.6, (2, 2, 4, 4):30.7, (2, 2, 6, 4):31.8, (2, 1, 6, 2):32.8
+TUNE m=16 o: cublas 12.3us | best cublas:12.3, (2, 1, 6, 1):14.0, (2, 2, 4, 1):14.7, (2, 2, 6, 1):15.6
+TUNE m=16 pooler: cublas 30.7us | best cublas:30.7, (2, 1, 6, 4):41.1, (2, 1, 6, 2):41.6, (2, 2, 4, 4):41.9
+TUNE m=16 unpooler: cublas 28.1us | best cublas:28.1, (2, 1, 6, 1):36.3, (2, 2, 4, 1):40.2, (2, 2, 6, 1):42.8
+TUNE m=16 router: cublas 21.4us | best (2, 1, 6, 32):14.7, (2, 1, 6, 64):14.9, (2, 1, 6, 16):15.5, (2, 2, 4, 32):16.0
+TUNE m=32 qkv_gate: cublas 21.9us | best cublas:21.9, (4, 2, 6, 4):39.7, (4, 2, 4, 4):40.3, (4, 2, 4, 16):44.4
+TUNE m=32 o: cublas 12.4us | best cublas:12.4, (4, 2, 4, 1):18.1, (4, 2, 6, 1):18.5, (4, 4, 3, 1):26.4
+TUNE m=32 pooler: cublas 31.6us | best cublas:31.6, (4, 2, 6, 4):51.9, (4, 2, 4, 4):52.2, (4, 2, 4, 8):53.7
+TUNE m=32 unpooler: cublas 28.5us | best cublas:28.5, (4, 2, 6, 1):47.2, (4, 2, 4, 1):48.0, (4, 2, 4, 2):59.2
+TUNE m=32 router: cublas 21.8us | best (4, 2, 6, 64):21.6, (4, 2, 4, 64):21.7, cublas:21.8, (4, 2, 4, 32):21.9
+TUNE m=128 qkv_gate: cublas 25.3us | best cublas:25.3
+TUNE m=128 o: cublas 12.8us | best cublas:12.8
+TUNE m=128 pooler: cublas 32.2us | best cublas:32.2
+TUNE m=128 unpooler: cublas 29.9us | best cublas:29.9
+TUNE m=128 router: cublas 22.9us | best cublas:22.9, (8, 1, 4, 16):32.9, (8, 2, 3, 32):34.8, (8, 2, 4, 32):35.1
+TUNE m=256 qkv_gate: cublas 29.1us | best cublas:29.1
+TUNE m=256 o: cublas 13.9us | best cublas:13.9
+TUNE m=256 pooler: cublas 38.3us | best cublas:38.3
+TUNE m=256 unpooler: cublas 33.4us | best cublas:33.4
+TUNE m=256 router: cublas 23.3us | best cublas:23.3, (8, 2, 4, 16):43.4, (8, 2, 3, 16):44.0, (8, 1, 4, 8):47.7
+TUNE took 4s

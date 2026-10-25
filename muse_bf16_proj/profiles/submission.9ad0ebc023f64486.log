@@ -1,0 +1,10 @@
+compiled in 32s
+TUNE empty graph 5.3us
+TUNE router m=1: (1, 1, 1):9.3, (1, 2, 2):9.8, (1, 4, 4):10.5, cat:12.4, cublas:18.4, bmm:21.5
+TUNE router m=5: (1, 1, 1):10.1, (1, 2, 2):10.1, (1, 4, 4):10.8, cat:13.7, cublas:20.1, bmm:21.7
+TUNE router m=8: (1, 2, 2):10.0, (1, 1, 1):10.4, (1, 4, 4):10.9, cat:13.8, cublas:20.5, bmm:21.5
+TUNE router m=9: (2, 1, 1):10.0, (2, 2, 2):10.3, (2, 4, 4):11.3, cat:14.3, cublas:20.3, bmm:21.6
+TUNE router m=16: (2, 2, 2):10.8, (2, 1, 1):10.8, (2, 4, 4):11.7, cat:13.8, cublas:20.5, bmm:21.7
+TUNE router m=32: (4, 4, 2):11.5, (4, 2, 2):13.2, (4, 1, 1):14.2, cat:15.0, cublas:21.2, bmm:21.9
+TUNE router m=128: cat:15.9, cublas:21.7, bmm:22.5, (8, 4, 2):24.1, (8, 2, 2):31.3
+TUNE router m=256: cat:18.4, cublas:23.1, bmm:23.4, (8, 4, 2):41.3, (8, 2, 2):55.4
