@@ -216,6 +216,16 @@ def _lop3(sm, w, ins, cycle, sim):
     _wr(w, ins.d, out)
 
 
+@op("SHF")
+def _shf(sm, w, ins, cycle, sim):
+    """SHF.L.W / SHF.R.W: funnel shift of the 64-bit pair {b:a} (b high), shift count wrapped to 5 bits."""
+    a, b = _u(w, ins.a).astype(np.uint64), _u(w, ins.b).astype(np.uint64)
+    n = np.uint64(int(ins.imm) & 31)
+    v = (b << np.uint64(32)) | a
+    r = (v << n) >> np.uint64(32) if ins.opt == "l" else v >> n
+    _wr(w, ins.d, (r & np.uint64(0xFFFFFFFF)).astype(np.uint32))
+
+
 @op("POPC")
 def _popc(sm, w, ins, cycle, sim):
     u = _u(w, ins.a)

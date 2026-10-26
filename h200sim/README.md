@@ -69,6 +69,7 @@ h200sim/.venv/bin/python -m h200sim.demo --kernel gemm --n 256 --k 1024 --bn 32 
 | `membar` is a synonym for `fence.sc` on sm_70 and later | | PTX ISA 8.7, 9.7.13.4 |
 | Launch overhead 2.1 us (stream) / 1.3 us (graph) on H100 | | Hazy Research |
 | Tensor power depends on the operand data; random data reaches the power limit | | Luo et al., Patel et al. (SC24 workshop), FAU blog |
+| H800 PCIe wgmma (Luo 2025, Table 11): all-zero data stays under ~200 W at 1560-1590 MHz; random data hits the 350 W limit and the clock falls to ~1275 MHz (dense) / ~1200 MHz (sparse). Scaling the zero-data draw to 1275 MHz (cubic) puts random/zero tensor power near 3.4x, which brackets the assumed 520 / 150 W | assumed absolute watts for H200 | Luo et al., 2025 |
 | Litmus-test outcomes allowed by the PTX memory model | | Lustig, Sahasrabuddhe, Giroux (ASPLOS 2019) |
 | 132 SMs, 4 sub-partitions, 64K registers, 228 KB shared memory, 4.8 TB/s, 989 TFLOPS | | NVIDIA H200 / Hopper documentation |
 
@@ -115,10 +116,11 @@ peak), `test_system` (the H200 power study's knee and 250 W point, NVLink / Infi
 - **Power**: the structure and four anchors are sourced (700 W TDP, the 550 W streaming knee, ~250 W at a 200 W cap, the
   345 MHz floor); the issue and tensor coefficients are assumptions. `time_us` is unscaled; `time_us_dvfs` applies the
   cap. The tensor derating from the Hopper papers is a separate, measured effect and is not combined with it.
-- **Sparse metadata**: the encoding, selector rules and fragment mapping are the spec's. Where inside a lane's 32-bit
-  word each chunk's nibble sits is drawn only in the spec's figures, which could not be read as text; the natural order
-  (row g in the low half, row g+8 in the high half, chunks ascending) is used, so a kernel written against real
-  hardware metadata could differ in bit placement.
+- **Sparse metadata**: the encoding, selector rules and fragment mapping are the spec's. The bit positions inside a
+  lane's 32-bit word were checked by rendering the PTX ISA 8.7 figures (f16/bf16 m16n8k16 and k32, tf32 k8): row g in
+  the low half, row g+8 in the high half, chunks ascending, and the lane pair split by column halves for k32. The
+  8-bit m16n8k64 figures (135/136) also match: lane 4g holds row g and lane 4g+1 row g+8 for columns 0-31, lanes
+  4g+2 / 4g+3 for columns 32-63. The sparse-wgmma figures 175 (f16 k32: lane pair 2i / 2i+1 split by column halves, row g+8 in the high half) and 179 (8-bit k64: lane 4g / 4g+1) match as well; 170-173, 177 and 180 were not opened.
 - **Control bits**: the semantics (stall counter, six counters, wait masks, Yield) are the measured ones; `annotate`
   is a plausible ptxas, not the real one (conservative at branch targets, no stall-count cap of 15, Yield only when you
   set it).

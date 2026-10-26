@@ -83,7 +83,7 @@ TIMING = {
     "MUFU_COS": ("xu", 14, 8), "MUFU_TANH": ("xu", 14, 8),
     # min/max, DPX dynamic-programming ops, bit twiddling
     "IMNMX": ("int", 5, 2), "FMNMX": ("fp32", 5, 1), "VIMNMX3": ("int", 6, 2), "VIADDMNMX": ("int", 6, 2),
-    "PRMT": ("int", 4, 2), "LOP3": ("int", 4, 2), "POPC": ("xu", 10, 4), "BREV": ("xu", 14, 4),
+    "PRMT": ("int", 4, 2), "LOP3": ("int", 4, 2), "SHF": ("int", 4, 2), "POPC": ("xu", 10, 4), "BREV": ("xu", 14, 4),
     "FLO": ("xu", 14, 4), "IABS": ("int", 4, 2), "SEL": ("int", 4, 2), "IMUL_HI": ("int", 5, 2),
     "ISETP": ("int", 4, 2), "FSETP": ("fp32", 4, 1), "PSETP": ("int", 4, 2),
     # warp-level
@@ -558,6 +558,9 @@ class Asm:
 
     def prmt(self, d, a, b, sel): self._gen("PRMT", d, a, b, sel)
     def lop3(self, d, a, b, c, lut): self._gen("LOP3", d, a, b, c, imm=lut)
+    def shf(self, d, a, b, n, left=True):
+        """Funnel shift {b:a} (b the high word) by the immediate n: left gives the high word, right the low."""
+        self._gen("SHF", d, a, b, imm=n, opt="l" if left else "r")
     def popc(self, d, a): self._gen("POPC", d, a)
     def brev(self, d, a): self._gen("BREV", d, a)
     def flo(self, d, a): self._gen("FLO", d, a)
