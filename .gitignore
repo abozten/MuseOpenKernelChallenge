@@ -4,3 +4,4 @@
 *.txt
 *.cypython
 */__pycache__/*
+h200sim/__pycache__/*
