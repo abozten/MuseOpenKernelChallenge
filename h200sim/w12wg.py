@@ -1,6 +1,6 @@
 """W12 weights into wgmma: the decoded weights are wgmma's A operand (registers), x its B (shared).
 
-python -m h200sim.w12wg [--n 2304] [--k 8192] [--m 128] [--wg 1] [--st 4] [--split 4] [--mcast 1]
+python -m h200sim.w12wg [--n 2304] [--k 8192] [--m 128] [--wg 1] [--st 4] [--split 4] [--mcast 1] [--bf16]
 
 The W12 decode (bf16c.py) leaves, in each lane, 4 groups of 4 registers in the mma.sync
 A-fragment layout; group 2q + half holds the tile's elements (h, q, e) with e in 4 half .. +3.
@@ -53,11 +53,15 @@ def pack_wg(bits: np.ndarray):
     return packed, b, esc
 
 
-def kernel(K: int, M: int, WG: int, ST: int, ktc: int, bp: int, tmap_x: int, mcast: int, NRT: int):
-    """params: W (k-major tiles [KT][NRT][1536 B]), out (fp32 [M, N]), N."""
+def kernel(K: int, M: int, WG: int, ST: int, ktc: int, bp: int, tmap_x: int, mcast: int, NRT: int, bf16=False):
+    """params: W (k-major tiles [KT][NRT][1536 B]), out (fp32 [M, N]), N.
+
+    bf16: the same pipeline on plain bf16 weights (k-major tiles [KT][NRT][2048 B], 128 B
+    pre-swizzled), A read by wgmma from shared memory: the uncompressed baseline."""
+    TB = 2048 if bf16 else 1536                 # bytes per 16 x 64 weight tile
     NP = (M + 7) // 8 * 8                       # wgmma N
     XB = NP * 128                               # x stage: NP rows x 128 B (64 bf16), swizzled
-    WB = 4 * WG * 1536
+    WB = 4 * WG * TB
     SB = (XB + WB + 1023) // 1024 * 1024        # stages 1024 B aligned (128 B swizzle atoms)
     MB = ST * SB                                # full barriers, then empty barriers
     PROD = 4 * WG                               # producer warp index
@@ -105,6 +109,17 @@ def kernel(K: int, M: int, WG: int, ST: int, ktc: int, bp: int, tmap_x: int, mca
     a.imad(sa, st, SB, 0)
     a.imad(mb, st, 8, MB)
     a.mbar_wait(mb, par)
+    if bf16:
+        a.shr(t2, wid, 2)
+        a.imad(t2, t2, 8192, XB)
+        a.iadd(t2, t2, sa)                      # this warpgroup's 64 x 64 A tile
+        a.wgmma_fence()
+        for s in range(4):
+            a.iadd(t, sa, 32 * s)
+            a.iadd(q, t2, 32 * s)
+            a.wgmma(acc, q, t, NP, 128, 128, accumulate=True, swizzle=128)
+        a.wgmma_commit()
+        a.bra("issued")
     # this warp's weight tile: 3 x 16 B per lane at XB + wid * 1536
     a.imad(t, wid, 1536, XB)
     a.iadd(t, t, sa)
@@ -192,7 +207,7 @@ def kernel(K: int, M: int, WG: int, ST: int, ktc: int, bp: int, tmap_x: int, mca
     a.ldc(wsrc, "W")
     a.imad(t, s_, ktc * NRT, 0)
     a.imad(t, rb, 4 * WG, t)
-    a.imad(t, t, 1536, 0)
+    a.imad(t, t, TB, 0)
     a.iadd(wsrc, wsrc, t)
     a.imad(col, s_, ktc * 64, 0)
     a.mov(it, 0)
@@ -223,7 +238,7 @@ def kernel(K: int, M: int, WG: int, ST: int, ktc: int, bp: int, tmap_x: int, mca
     a.iadd(t, sa, XB)
     with a.guard(l0):
         a.tma_load_1d(t, wsrc, WB, mb)
-    a.iadd(wsrc, wsrc, NRT * 1536)
+    a.iadd(wsrc, wsrc, NRT * TB)
     a.iadd(col, col, 64)
     a.iadd(it, it, 1)
     a.setp_lt(p, it, ktc)
@@ -232,16 +247,23 @@ def kernel(K: int, M: int, WG: int, ST: int, ktc: int, bp: int, tmap_x: int, mca
     return a.build(), MB + 16 * ST
 
 
-def run(n, k, m, WG, ST, split, mcast, seed=0, verbose=True):
+def run(n, k, m, WG, ST, split, mcast, seed=0, verbose=True, bf16=False):
     rng = np.random.default_rng(seed)
     wbits = to_bf16_bits(rng.standard_normal((n, k), dtype=np.float32) / np.sqrt(k))
     NP = (m + 7) // 8 * 8
     x = from_bf16_bits(to_bf16_bits(rng.standard_normal((NP, k), dtype=np.float32)))
     x[m:] = 0
-    packed, b, esc = pack_wg(wbits)
-    d, bp = b & 7, b & ~7
     NRT, KT = n // 16, k // 64
-    wdat = packed.transpose(1, 0, 2, 3, 4).copy()            # k-major tiles [KT][NRT]
+    if bf16:
+        d, bp, esc = 0, 0, []
+        t = wbits.reshape(n, KT, 8, 8).transpose(1, 0, 2, 3)  # [KT][row][chunk][8]
+        wdat = np.empty_like(t)
+        for r in range(8):                                    # 128 B swizzle: chunk ^ row % 8
+            wdat[:, r::8, np.arange(8) ^ r] = t[:, r::8]
+    else:
+        packed, b, esc = pack_wg(wbits)
+        d, bp = b & 7, b & ~7
+        wdat = packed.transpose(1, 0, 2, 3, 4).copy()        # k-major tiles [KT][NRT]
     sim = Sim(H200())
     pW, px, po = sim.mem.alloc(wdat.nbytes), sim.mem.alloc(x.size * 2), sim.mem.alloc(NP * n * 4)
     sim.mem.write(pW, wdat)
@@ -250,7 +272,7 @@ def run(n, k, m, WG, ST, split, mcast, seed=0, verbose=True):
     tm = sim.tensor_map(px, NP, k, 2, NP // mcast, 64, swizzle=128)
     nrb = NRT // (4 * WG)
     ktc = KT // split
-    prog, smem = kernel(k, m, WG, ST, ktc, bp, tm, mcast, NRT)
+    prog, smem = kernel(k, m, WG, ST, ktc, bp, tm, mcast, NRT, bf16)
     t0 = time.time()
     st = sim.launch(prog, nrb * split, (4 * WG + 1) * 32,
                     {"W": pW, "out": po, "N": n, "inv_nrb": (1 << 32) // nrb + 1, "neg_nrb": (1 << 32) - nrb},
@@ -264,7 +286,7 @@ def run(n, k, m, WG, ST, split, mcast, seed=0, verbose=True):
     err = np.linalg.norm(out - ref) / np.linalg.norm(ref)
     flops = 2.0 * m * n * k
     if verbose:
-        print(f"w12 wgmma n={n} k={k} m={m} WG={WG} ST={ST} split={split} mcast={mcast}: {st.time_us:.2f} us, "
+        print(f"{'bf16' if bf16 else 'w12'} wgmma n={n} k={k} m={m} WG={WG} ST={ST} split={split} mcast={mcast}: {st.time_us:.2f} us, "
               f"{flops / st.time_us / 1e6:.0f} TFLOPS, {st.hbm_bytes / 1e6:.1f} MB HBM at {st.hbm_tbs:.2f} TB/s, "
               f"issue {100 * st.issue_util:.0f}%, err {err:.1e} (wall {wall:.0f}s)", flush=True)
     return st, err
@@ -279,8 +301,9 @@ def main():
     ap.add_argument("--st", type=int, default=4)
     ap.add_argument("--split", type=int, default=4)
     ap.add_argument("--mcast", type=int, default=1)
+    ap.add_argument("--bf16", action="store_true")
     args = ap.parse_args()
-    st, _ = run(args.n, args.k, args.m, args.wg, args.st, args.split, args.mcast)
+    st, _ = run(args.n, args.k, args.m, args.wg, args.st, args.split, args.mcast, bf16=args.bf16)
     print("  " + st.report().replace("\n", "\n  "))
 
 
