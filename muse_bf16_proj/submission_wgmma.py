@@ -1461,7 +1461,9 @@ def _module():
                + W12G_LAUNCH_SRC)
         _ext = load_inline("muse_w12_router", cpp_sources=CPP_SRC, cuda_sources=src,
                            functions=["router", "w12", "w12_init", "router_big_run", "w12g", "w12g_init"],
-                           extra_cuda_cflags=["-O3"], verbose=False)
+                           # ponytail: diagnostic, -Werror makes ptxas's "wgmma serialized" warning fail the build
+                           # and land at the end of the log; drop it once the check answers
+                           extra_cuda_cflags=["-O3", "-Xptxas=-Werror"], verbose=True)
     return _ext
 
 
