@@ -24,3 +24,7 @@ dist/
 .idea/
 .vscode/
 *.swp
+
+#profile results
+muse_bf16_proj/profiles/*
+profiles/*

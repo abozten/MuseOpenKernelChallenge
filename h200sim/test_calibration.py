@@ -115,6 +115,32 @@ def test_l2_prefetch_qualifier_pulls_neighbours():
     assert got[(0, "hits")] == 0 and got[(256, "hits")] == 1    # the second load now finds its sector in L2
 
 
+def test_streaming_read_matches_h200():
+    """A cold contiguous read (264 CTAs x 256 threads, 4 x 16 B loads in flight, .L2::256B) of 8.7 MB
+    measured ~1 us + bytes / 4.25 TB/s on the judge's H200 (CUDA-graph replay, empty-graph cost removed)."""
+    grid, threads, U = 264, 256, 4
+    per = 2048                                                  # 16 B elements per CTA
+    a = Asm("rdc")
+    tid, cta, p, t, i, acc, q = (a.reg() for _ in range(7))
+    v = [a.reg(4) for _ in range(U)]
+    a.s2r(tid, "tid"); a.s2r(cta, "ctaid"); a.ldc(t, "p")
+    a.imad(p, cta, per * 16, t); a.shl(t, tid, 4); a.iadd(p, p, t)
+    a.mov(acc, 0); a.mov(i, 0)
+    a.label("loop")
+    for u in range(U):
+        a.ldg(v[u], p, u * threads * 16, 16, cache="cs", l2pf=256)
+    for u in range(U):
+        a.xor(acc, acc, v[u])
+    a.iadd(p, p, U * threads * 16); a.iadd(i, i, 1)
+    a.setp_lt(q, i, per // (U * threads)); a.brnz(q, "loop")
+    a.exit()
+    sim = Sim(H200())
+    nbytes = grid * per * 16
+    st = sim.launch(a.build(), grid, threads, {"p": sim.mem.alloc(nbytes)})
+    hw = 1.0 + nbytes / 4.25e6
+    assert 0.85 * hw < st.time_us < 1.1 * hw, (st.time_us, hw)
+
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_"):

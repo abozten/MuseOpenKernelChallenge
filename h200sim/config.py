@@ -30,7 +30,7 @@ class H200:
     clock_base_ghz: float = 1.665
     clock_min_ghz: float = 0.345
     hbm_tbs: float = 4.8
-    hbm_efficiency: float = 0.92      # fraction of peak a streaming read reaches
+    hbm_efficiency: float = 0.885     # fraction of peak a streaming read reaches: 4.25 of 4.8 TB/s measured on the judge H200 (cold L2, 6-64 MB)
     l2_bytes: int = 50 * 1024 * 1024
     l2_bytes_per_cycle: float = 4000  # aggregate L2 -> SM fabric (measured 3942-4472 B/clk)
     sm_port_bytes_per_cycle: float = 64
@@ -60,7 +60,7 @@ class H200:
     # 8 and 16 are extrapolated ("throughput falls as cluster size grows").
     dsmem_bytes_per_cycle: tuple = ((2, 16.4), (4, 13.9), (8, 11.0), (16, 8.0))
     tma_issue_lat: int = 170          # TMA access latency is ~170 cycles above a regular access
-    tensor_flops_per_smsp_cycle: int = 1024   # dense bf16 (989 TFLOP/s over 132x4 sub-partitions)
+    tensor_flops_per_smsp_cycle: int = 1024   # dense bf16: 989 TFLOP/s = 132 SMs x 4096 FLOP/clk at 1.83 GHz (datasheet clock, not 1.98)
     wgmma_lat: int = 30
     smem_bytes_per_cycle: int = 128   # shared memory port: wgmma operand reads and TMA writes contend here
     fp64_tensor_flops_per_smsp_cycle: int = 64   # 67 TFLOPS FP64 tensor (whitepaper) = 2x the FP64 vector rate

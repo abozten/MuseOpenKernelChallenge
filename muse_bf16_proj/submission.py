@@ -389,6 +389,98 @@ __device__ __forceinline__ void w12_reduce(const W12Args& a, int rb, int R, int 
   if (threadIdx.x == 0) a.cnt[rb] = 0;
 }
 
+// Contiguous kernel: one CTA per RT 16-row tiles over all of K, weights row-tile-major
+// ([rt][kt][3][32] uint4), so a CTA reads RT contiguous ranges. Its NWK warps split K (warp w
+// takes k tiles w, w + NWK, ...: on each step the CTA's warps read one contiguous chunk per row
+// tile), stream them into registers U ahead (one x fragment serving the RT tiles) and sum in
+// shared memory in a fixed order: no k slices across CTAs, no workspace. The tiles' escapes are
+// copied to shared memory while the first tiles load. NWR groups of NWK warps take consecutive
+// RT-tile groups: x then comes from L2 once per NWR RT tiles and the other groups hit L1 (x's L2
+// traffic, one x per CTA, is what slows m >= 16).
+template <int NT, int NWK, int U, int RT, int NWR>
+__global__ void __launch_bounds__(NWR * NWK * 32) w12c_gemm(const W12Args a) {
+  constexpr int RTC = NWR * RT, NTH = NWR * NWK * 32, ESC_CAP = 128 * RTC;
+  __shared__ float red[NWR][NWK][RT][NT][4][32];
+  __shared__ W12Esc s_esc[ESC_CAP];
+  const int tid = threadIdx.x, wr = (tid >> 5) / NWK, warp = (tid >> 5) % NWK, lane = tid & 31;
+  const int g = lane >> 2, c = lane & 3;
+  const int KT = a.K / 64, rt0 = blockIdx.x * RTC, J = KT / NWK;
+  // each CTA starts its k steps at its own offset, so the CTAs don't all read the same x lines
+  // (one L2 slice) at once
+  const int rot = blockIdx.x % J;
+  const uint4* wbase = a.wp + ((size_t)(rt0 + wr * RT) * KT + warp) * 96 + lane;
+
+  int toff[NT];
+#pragma unroll
+  for (int t = 0; t < NT; ++t) {
+    const int tok = 8 * t + g;
+    toff[t] = tok < a.M ? tok * a.K : -1;
+  }
+  auto load = [&](int j, uint4 (&wb)[RT][3], uint4 (&xb)[NT][2]) {
+    j = j + rot >= J ? j + rot - J : j + rot;
+#pragma unroll
+    for (int r = 0; r < RT; ++r) {
+      const uint4* p = wbase + ((size_t)r * KT + (size_t)j * NWK) * 96;
+#pragma unroll
+      for (int l = 0; l < 3; ++l) wb[r][l] = w12_ld_stream(p + 32 * l);
+    }
+    const int kx = (warp + j * NWK) * 64 + 8 * c;
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+      for (int q = 0; q < 2; ++q)
+        xb[t][q] = toff[t] >= 0 ? __ldg(reinterpret_cast<const uint4*>(a.x + toff[t] + kx + 32 * q))
+                                : make_uint4(0, 0, 0, 0);
+  };
+
+  float acc[RT][NT][4], acc2[RT][NT][4];
+#pragma unroll
+  for (int r = 0; r < RT; ++r)
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) acc[r][t][e] = acc2[r][t][e] = 0.f;
+  uint4 wb[U][RT][3], xb[U][NT][2];
+#pragma unroll
+  for (int j = 0; j < U; ++j) load(j, wb[j], xb[j]);
+  // after the first loads are in flight
+  const int e0 = a.esc_off[rt0 * KT], ne = a.esc_off[(rt0 + RTC) * KT] - e0;
+  for (int i = tid; i < min(ne, ESC_CAP); i += NTH) s_esc[i] = a.esc[e0 + i];
+  for (int j0 = 0; j0 < J; j0 += U) {
+#pragma unroll
+    for (int j = 0; j < U; ++j) {
+#pragma unroll
+      for (int r = 0; r < RT; ++r) w12_tile<NT>(acc[r], acc2[r], wb[j][r], xb[j], a.bb);
+      if (j0 + j + U < J) load(j0 + j + U, wb[j], xb[j]);
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < RT; ++r)
+#pragma unroll
+    for (int t = 0; t < NT; ++t)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) red[wr][warp][r][t][e][lane] = acc[r][t][e] + acc2[r][t][e];
+  __syncthreads();
+  // thread i: row i % (16 RTC) of the CTA (tile r, row rr), token i / (16 RTC); its fragment slot:
+  // lane 4 (rr & 7) + (tok & 7) / 2, element 2 (rr >> 3) + (tok & 1), token tile tok >> 3
+  for (int i = tid; i < 16 * RTC * 8 * NT; i += NTH) {
+    const int row = i % (16 * RTC), tok = i / (16 * RTC), r = row >> 4, rr = row & 15;
+    if (tok >= a.M) continue;
+    const int ln = 4 * (rr & 7) + ((tok & 7) >> 1), e = 2 * (rr >> 3) + (tok & 1), t = tok >> 3;
+    float v = 0.f;
+#pragma unroll
+    for (int w = 0; w < NWK; ++w) v += red[r / RT][w][r % RT][t][e][ln];
+    const int k1 = a.esc_off[(rt0 + r) * KT] - e0, k2e = a.esc_off[(rt0 + r + 1) * KT] - e0;
+    for (int k2 = k1; k2 < k2e; ++k2) {
+      const W12Esc es = k2 < ESC_CAP ? s_esc[k2] : a.esc[e0 + k2];
+      if (es.r != rr) continue;
+      const float xv = __bfloat162float(a.x[(size_t)tok * a.K + es.k]);
+      v = fmaf(xv, es.wt, fmaf(-xv, es.wd, v));
+    }
+    a.out[(size_t)tok * a.N + (rt0 + r) * 16 + rr] = __float2bfloat16(v * a.scale);
+  }
+}
+
 // Register ring. Grid: nrb row blocks (NW row tiles) x S k slices of ktc tiles; warp w takes
 // row tile rb NW + w and streams its tiles into registers U ahead, x through L1.
 template <int NT, int U, int NW>
@@ -854,7 +946,16 @@ void router(torch::Tensor wp, torch::Tensor x, torch::Tensor out, torch::Tensor 
 W12_LAUNCH_SRC = r"""
 // Variants; keep in sync with W12R / W12T in Python.
 // Register ring: (NT, U, NW).
-#define W12R_VARIANTS(X) X(1, 2, 8) X(1, 2, 4) X(2, 2, 8) X(2, 2, 4) X(4, 2, 8) X(4, 2, 4)
+#define W12R_VARIANTS(X) X(1, 2, 8) X(1, 2, 4) X(2, 2, 8) X(2, 2, 4) X(4, 2, 8) X(4, 2, 4) \
+  X(1, 4, 8) X(1, 4, 4) X(1, 8, 8) X(1, 8, 4) X(2, 4, 8) X(2, 4, 4)
+// Contiguous kernel: (NT, NWK, U, RT, NWR).
+#define W12C_VARIANTS(X) X(1, 4, 4, 1, 1) X(1, 8, 2, 1, 1) X(1, 8, 4, 1, 1) X(1, 16, 2, 1, 1) \
+  X(1, 16, 4, 1, 1) X(1, 4, 2, 1, 1) X(1, 2, 4, 1, 1) X(1, 8, 2, 2, 1) X(1, 16, 2, 2, 1) \
+  X(2, 8, 2, 1, 1) X(2, 8, 4, 1, 1) X(2, 16, 2, 1, 1) X(2, 4, 2, 1, 1) X(2, 8, 2, 2, 1) \
+  X(2, 16, 2, 2, 1) X(2, 8, 1, 2, 1) X(4, 8, 2, 1, 1) X(4, 4, 2, 1, 1) X(4, 8, 1, 2, 1) \
+  X(4, 8, 2, 2, 1) X(2, 4, 2, 1, 4) X(2, 8, 2, 1, 4) X(2, 2, 2, 1, 8) X(2, 4, 2, 2, 2) \
+  X(2, 8, 2, 1, 2) X(2, 4, 2, 1, 2) X(4, 4, 2, 1, 4) X(4, 2, 2, 1, 8) X(4, 4, 2, 2, 2) \
+  X(4, 8, 2, 1, 2) X(4, 4, 2, 1, 2) X(4, 2, 2, 2, 4)
 // TMA kernel: (NT, ST, NW, RT, KS).
 #define W12T_VARIANTS(X) \
   X(1, 8, 4, 1, 1) X(1, 6, 4, 1, 2) X(1, 16, 4, 1, 1) X(1, 24, 4, 1, 1) X(1, 16, 2, 1, 1) \
@@ -918,6 +1019,14 @@ void w12(torch::Tensor wp, torch::Tensor x, torch::Tensor out, torch::Tensor ws,
     return;                                                                                  \
   }
     W12T_VARIANTS(CASE)
+#undef CASE
+  } else if (kind == 2) {
+#define CASE(nt, nwk, u, rt, nwr)                                                       \
+  if (NT == nt && B == nwk && A == u && C == rt && D == nwr) {                          \
+    w12c_gemm<nt, nwk, u, rt, nwr><<<N / 16 / rt / nwr, nwr * nwk * 32, 0, stream>>>(a); \
+    return;                                                                             \
+  }
+    W12C_VARIANTS(CASE)
 #undef CASE
   }
   TORCH_CHECK(false, "no w12 variant kind=", kind, " NT=", NT, " ", A, " ", B, " ", C, " ", D);
@@ -1224,14 +1333,16 @@ def w12_pack(w):
     got = got.permute(0, 4, 2, 1, 5, 3, 6).reshape(n, k)
     ref = torch.where(ok, bits - (2 * d << 7), dec)
     assert torch.equal(got, ref), "W12 decode mismatch"
-    return {"wp": wp.transpose(0, 1).contiguous(), "bb": bp * 0x01010101, "scale": 2.0 ** (2 * d),
+    return {"wp": wp.transpose(0, 1).contiguous(), "wpr": wp, "bb": bp * 0x01010101, "scale": 2.0 ** (2 * d),
             "esc": esc.contiguous(), "esc_off": off.to(torch.int32), "n_esc": int(rows.numel()), "b": b}
 
 
 W12_MAX_TOKENS = 32
 W12_WS_FLOATS = 32 * W12_MAX_TOKENS * 8192  # the register kernel's partials: S <= 32 slices
 # (NT, U, NW) and (NT, ST, NW, RT, KS), as W12_LAUNCH_SRC instantiates them.
-W12R = [(1, 2, 8), (1, 2, 4), (2, 2, 8), (2, 2, 4), (4, 2, 8), (4, 2, 4)]
+W12R = [(1, 2, 8), (1, 2, 4), (2, 2, 8), (2, 2, 4), (4, 2, 8), (4, 2, 4),
+        (1, 4, 8), (1, 4, 4), (1, 8, 8), (1, 8, 4), (2, 4, 8), (2, 4, 4)]  # deeper rings: more bytes in flight
+W12C = [(1, 4, 4, 1, 1), (1, 8, 2, 1, 1), (1, 8, 4, 1, 1), (1, 16, 2, 1, 1), (1, 16, 4, 1, 1), (1, 4, 2, 1, 1), (1, 2, 4, 1, 1), (1, 8, 2, 2, 1), (1, 16, 2, 2, 1), (2, 8, 2, 1, 1), (2, 8, 4, 1, 1), (2, 16, 2, 1, 1), (2, 4, 2, 1, 1), (2, 8, 2, 2, 1), (2, 16, 2, 2, 1), (2, 8, 1, 2, 1), (4, 8, 2, 1, 1), (4, 4, 2, 1, 1), (4, 8, 1, 2, 1), (4, 8, 2, 2, 1), (2, 4, 2, 1, 4), (2, 8, 2, 1, 4), (2, 2, 2, 1, 8), (2, 4, 2, 2, 2), (2, 8, 2, 1, 2), (2, 4, 2, 1, 2), (4, 4, 2, 1, 4), (4, 2, 2, 1, 8), (4, 4, 2, 2, 2), (4, 8, 2, 1, 2), (4, 4, 2, 1, 2), (4, 2, 2, 2, 4)]  # (NT, NWK, U, RT, NWR)
 W12T = ([(1, st, nw, rt, ks) for st, nw, rt, ks in
          ((8, 4, 1, 1), (6, 4, 1, 2), (16, 4, 1, 1), (24, 4, 1, 1), (16, 2, 1, 1), (12, 2, 2, 1), (8, 4, 2, 1),
           (3, 4, 1, 4), (4, 4, 1, 4), (6, 4, 1, 4), (3, 4, 1, 8))]
@@ -1251,15 +1362,19 @@ def _w12(state, x, layer, n, cfg):
     kind, a, b, c, d, s = cfg
     p = state["w12"][(layer, n)]
     out = torch.empty((x.shape[0], n), device=x.device, dtype=torch.bfloat16)
-    state["ext"].w12(p["wp"], x, out, state["ws"], state["cnt"], p["esc_off"], p["esc"], n, s,
+    state["ext"].w12(p["wpr"] if kind == 2 else p["wp"], x, out, state["ws"], state["cnt"], p["esc_off"], p["esc"], n, s,
                      p["scale"], p["bb"], kind, _w12_nt(x.shape[0]), a, b, c, d)
     return out
 
 
 def _w12_configs(n, k, m, max_smem):
     """(kind, A, B, C, D, S): kind 0 the register kernel (A = U, B = NW), kind 1 the TMA kernel
-    (A = ST, B = NW, C = RT, D = KS; S <= 8 a cluster); S k slices."""
+    (A = ST, B = NW, C = RT, D = KS; S <= 8 a cluster), kind 2 the contiguous kernel (A = U,
+    B = NWK, C = RT, D = NWR; S = 1); S k slices."""
     kt, nt, out = k // 64, _w12_nt(m), []
+    for (t, nwk, u, rt, nwr) in W12C:
+        if t == nt and kt % nwk == 0 and (kt // nwk) % u == 0 and (n // 16) % (rt * nwr) == 0:
+            out.append((2, u, nwk, rt, nwr, 1))
     for s in (1, 2, 4, 8, 16, 32):
         if kt % s:
             continue
@@ -1281,10 +1396,48 @@ def _w12_configs(n, k, m, max_smem):
 W12_SHAPES = [("qkv_gate", 2304), ("o", 8192), ("pooler", 4096), ("unpooler", 8192), ("unpooler", 1024)]
 W12_MS = {("unpooler", 8192): [16, 32], ("unpooler", 1024): [1, 8]}
 
+# Where cuBLAS runs, the same product asked four ways: cuBLAS's heuristics pick a different kernel
+# for each (cuBLAS reads the pooler at ~2.5 TB/s as x @ W.T but the unpooler, as large, at ~3.3).
+BLAS = {
+    "tn": lambda s, x, l, n: x @ s["w"][l][:n].T,
+    "nn": lambda s, x, l, n: x @ s["wt"][l][:, :n],
+    "nt": lambda s, x, l, n: (s["w"][l][:n] @ x.T).T,
+    "bias": lambda s, x, l, n: torch.nn.functional.linear(x, s["w"][l][:n], s["zb"][:n]),  # cuBLASLt
+}
+BLAS_MS = {("unpooler", 8192): [16, 32, 128, 256], ("unpooler", 1024): [1, 8]}
+
+
+def _tune_blas(state, flush):
+    """For each shape and token count the fastest BLAS variant; returns its times too."""
+    table, times = {}, {}
+    for layer, n in W12_SHAPES:
+        w = state["w"][layer][:n]
+        for m in BLAS_MS.get((layer, n), [1, 8, 16, 32, 128, 256]):
+            x = torch.randn((m, w.shape[1]), device="cuda").to(torch.bfloat16)
+            ref = x.float() @ w.float().T
+            res = []
+            for v, fn in BLAS.items():
+                out = fn(state, x, layer, n)
+                assert out.shape == ref.shape and float((out.float() - ref).norm() / ref.norm()) < 1e-2, v
+                res.append((_time(lambda: fn(state, x, layer, n), flush, reps=40), v))
+            res.sort()
+            tn = next(t for t, v in res if v == "tn")
+            # ponytail: a 0.4 µs margin to leave x @ W.T, as smaller wins were noise on the judge
+            times[(layer, n, m)], table[(layer, n, m)] = res[0] if res[0][0] < tn - 0.4 else (tn, "tn")
+            print(f"TUNE blas {layer} n={n} m={m}: " + " ".join(f"{v}:{t:.1f}" for t, v in res), flush=True)
+    return table, times
+
+
+def _blas_cfg(state, layer, n, m):
+    tab = state["blas"]
+    ms = sorted(t[2] for t in tab if t[0] == layer and t[1] == n)
+    return tab[(layer, n, next((u for u in ms if u >= m), ms[-1]))]
+
 
 def _tune_w12(state, deadline):
     """For each shape and token count pick the fastest W12 config, or cuBLAS (None) if that's faster."""
     flush = torch.ones(256 << 20, dtype=torch.uint8, device="cuda")
+    state["blas"], blas_t = _tune_blas(state, flush)
     table = {}
     for layer, n in W12_SHAPES:
         w = state["w"][layer][:n]
@@ -1295,7 +1448,7 @@ def _tune_w12(state, deadline):
             x = torch.randn((m, w.shape[1]), device="cuda").to(torch.bfloat16)
             ref = (x.double() @ w.double().T).float()
             rn = float(ref.norm())
-            base = _time(lambda: x @ w.T, flush, reps=40)
+            base = blas_t[(layer, n, m)]
             res = []
             for cfg in _w12_configs(n, w.shape[1], m, state["w12_smem"]):
                 err = float((_w12(state, x, layer, n, cfg).float() - ref).norm()) / rn
@@ -1311,10 +1464,12 @@ def _tune_w12(state, deadline):
                     best, bc = t, cfg
             table[(layer, n, m)] = bc
             reg = [r for r in res if r[1][0] == 0][:3]
-            shr = [r for r in res if r[1][0] >= 1][:8]
+            shr = [r for r in res if r[1][0] == 1][:8]
+            con = [r for r in res if r[1][0] == 2][:4]
             print(f"TUNE {layer} n={n} m={m}: cublas {base:.1f}us w12 {best:.1f}us {bc} | reg "
                   + " ".join(f"{c[1:]}:{t:.1f}" for t, c in reg) + " | tma "
-                  + " ".join(f"{c}:{t:.1f}" for t, c in shr), flush=True)
+                  + " ".join(f"{c}:{t:.1f}" for t, c in shr) + " | contig "
+                  + " ".join(f"{c[1:5]}:{t:.1f}" for t, c in con), flush=True)
     del flush
     return table
 
@@ -1338,6 +1493,8 @@ def prepare(weights: Weights):
     state = {
         "ext": ext,
         "w": {name: weights[name].contiguous() for name in ("qkv_gate", "o", "pooler", "unpooler")},
+        "wt": {name: weights[name].t().contiguous() for name in ("qkv_gate", "o", "pooler", "unpooler")},
+        "zb": torch.zeros(8192, dtype=torch.bfloat16, device=router.device),
         "router_p": repack(torch.cat([hi, lo], dim=1)),
         "router_hi": hi.contiguous(),
         "router_lo": lo.contiguous(),
@@ -1374,7 +1531,7 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     if layer != "router":
         bc = _w12_cfg(state, layer, n, m)
         if bc is None:
-            return x @ state["w"][layer][:n].T
+            return BLAS[_blas_cfg(state, layer, n, m)](state, x, layer, n)
         return _w12(state, x.contiguous(), layer, n, bc)
     v = state["table"].get(m)
     if v is None:  # an untuned token count: the tuned choice for the next one up
