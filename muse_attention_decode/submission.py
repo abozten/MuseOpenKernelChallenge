@@ -373,7 +373,8 @@ def _decode(data, cfg, qkv, cos_sin, rope, scaled, batch, hq, hkv, d, page, devi
     window = cfg["window"]
     page_table = data["page_table"]
     pairs = hkv // 2
-    block_n = 64
+    block_n = 128 if window else 64
+    warps = 8 if window else 4
     merge = bool(window) and batch * pairs >= 16
     if merge:
         ns = FUSED_SPLITS
@@ -394,7 +395,7 @@ def _decode(data, cfg, qkv, cos_sin, rope, scaled, batch, hq, hkv, d, page, devi
         qkv, data["positions"], data["cache_loc"], cos_sin, data["k_cache"], data["v_cache"], page_table,
         data["cache_seqlens"], data["k_scale"], data["v_scale"], part_acc, part_ml, _COUNTERS[key], out, scale,
         page_table.stride(0), chunk, HQ=hq, HKV=hkv, G=hq // hkv, PAGE=page, WINDOW=window, NS=ns, ROPE=rope,
-        SCALED=scaled, MERGE=merge, BLOCK_N=block_n, num_warps=4, num_stages=3)
+        SCALED=scaled, MERGE=merge, BLOCK_N=block_n, num_warps=warps, num_stages=3)
     if not merge:
         _combine[(batch * hq,)](part_acc, part_ml, qkv, data["v_scale"], out, HQ=hq, HKV=hkv, NS=ns,
                                 SB=min(64, triton.next_power_of_2(ns)), num_warps=2)
