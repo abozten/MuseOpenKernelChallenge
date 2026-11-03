@@ -28,3 +28,5 @@ dist/
 #profile results
 muse_bf16_proj/profiles/*
 profiles/*
+*.json
+*.txt

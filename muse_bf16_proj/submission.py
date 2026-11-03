@@ -1297,8 +1297,9 @@ def _tune_w12(state, deadline):
                 res.append((_time(lambda: _w12(state, x, layer, n, cfg), flush, reps=10), cfg))
             res.sort()
             best, bc = base, None
-            for _, cfg in res[:3]:
-                t = _time(lambda: _w12(state, x, layer, n, cfg), flush, reps=40)
+            # The leaders are often within ~0.3 us: re-time four of them, longer, before picking.
+            for _, cfg in res[:4]:
+                t = _time(lambda: _w12(state, x, layer, n, cfg), flush, reps=60)
                 if t < best:
                     best, bc = t, cfg
             table[(layer, n, m)] = bc
